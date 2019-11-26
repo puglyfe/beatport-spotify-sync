@@ -60,7 +60,7 @@ const searchTrack = async (client, track) => {
   // which causes inconsistent results on Spotify.
   const searchQueries = [];
   Artists.split(',').forEach(artist => {
-    const query = `artist:${Artists} track:${sanitizeTrackName(Name)}`;
+    const query = `artist:${artist} track:${sanitizeTrackName(Name)}`;
     console.log('searchTrack :: query :: ', query);
     const request = client
       .searchTracks(query)
@@ -91,11 +91,9 @@ const searchTrack = async (client, track) => {
 
 const batchImportTracks = async collection => {
   console.log('batchImportTracks :: ', collection);
-  const requests = collection.map(async track => {
-    await importTrack(track.track.Item, track);
-  });
-
-  await Promise.all(requests);
+  for (let track of collection) {
+    await importTrack(track.track.Item, track); // eslint-disable-line no-await-in-loop
+  }
 
   return Promise.resolve();
 };
@@ -127,7 +125,7 @@ const importTrack = async (trackId, track) => {
   });
 
   // TODO: only refresh the access token when necessary.
-  await refreshAccessToken(spotify);
+  // await refreshAccessToken(spotify);
 
   const spotifyUri = await searchTrack(spotify, track.track);
 
@@ -187,19 +185,21 @@ exports.importTracks = functions.https.onRequest(async (req, res) => {
  */
 exports.retrySpotify = functions.https.onRequest(async (req, res) => {
   console.log('retrySpotify');
-  // Acknowledge the response right way. This is gonna get heavy.
-  res.send(200);
 
   const orphanTracks = await admin
     .database()
     .ref('/tracks')
     .orderByChild('spotifyUri')
     .equalTo(null)
+    .limitToFirst(10)
     .once('value')
     .then(snapshot => snapshot.val());
 
-  await batchImportTracks(Object.values(orphanTracks));
+  // Acknowledge the response right way. This is gonna get heavy.
+  res.status(200).send(JSON.stringify(orphanTracks));
 
+  await batchImportTracks(Object.values(orphanTracks));
+  console.log('retrySpotify :: complete');
   return;
 });
 
