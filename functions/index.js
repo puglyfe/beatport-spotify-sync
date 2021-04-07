@@ -8,11 +8,11 @@ const PLAYLIST_ID = '6WyKo6Zejscls8G676N8UX';
 
 // clientId, clientSecret and refreshToken has been set on the api object previous to this call.
 const refreshAccessToken = client => {
-  console.log('refreshAccessToken :: ', client);
+  functions.logger.log('refreshAccessToken :: ', client);
   return client
     .refreshAccessToken()
     .then(async data => {
-      console.log('refreshAccessToken :: success', data.body);
+      functions.logger.log('refreshAccessToken :: success', data.body);
       const { access_token } = data.body;
       // Save the access token so that it's used in future calls
       client.setAccessToken(access_token);
@@ -25,21 +25,21 @@ const refreshAccessToken = client => {
       return;
     })
     .catch(err => {
-      console.log('refreshAccessToken :: error :: ', err);
+      functions.logger.log('refreshAccessToken :: error :: ', err);
     });
 };
 
 const addTrackToPlaylist = (client, track, playlist = PLAYLIST_ID) => {
-  console.log('addTrackToPlaylist :: ', track, playlist);
+  functions.logger.log('addTrackToPlaylist :: ', track, playlist);
 
   return client
     .addTracksToPlaylist(playlist, [track], { position: 0 })
     .then(data => {
-      console.log('addTrackToPlaylist :: success :: ', data.body);
+      functions.logger.log('addTrackToPlaylist :: success :: ', data.body);
       return data.body.snapshot_id;
     })
     .catch(err => {
-      console.log('addTrackToPlaylist :: error :: ', err);
+      functions.logger.log('addTrackToPlaylist :: error :: ', err);
       throw err;
     });
 };
@@ -53,19 +53,27 @@ const sanitizeTrackName = name =>
     .replace(/[()]/g, '');
 
 const searchTrack = async (client, track) => {
-  console.log('searchTrack :: ', track);
-  const { Artists, Name } = track;
+  functions.logger.log('searchTrack :: ', track);
+
+  // Capitalization is inconsistent, so lowercase all the keys.
+  // This will only work for 1 layer.
+  const sanitizedTrack = Object.keys(track).reduce((obj, key) => {
+    obj[key.toLowerCase()] = track[key];
+    return obj;
+  }, {});
+
+  const { artists, name } = sanitizedTrack;
 
   // Beatport concatenates the artist names with the remixer names,
   // which causes inconsistent results on Spotify.
   const searchQueries = [];
-  Artists.split(',').forEach(artist => {
-    const query = `artist:${artist} track:${sanitizeTrackName(Name)}`;
-    console.log('searchTrack :: query :: ', query);
+  artists.split(',').forEach(artist => {
+    const query = `artist:${artist} track:${sanitizeTrackName(name)}`;
+    functions.logger.log('searchTrack :: query :: ', query);
     const request = client
       .searchTracks(query)
       .then(data => {
-        console.log('searchTrack :: success :: ', data.body);
+        functions.logger.log('searchTrack :: success :: ', data.body);
         const { tracks } = data.body;
 
         if (tracks && tracks.items && tracks.items.length) {
@@ -76,7 +84,7 @@ const searchTrack = async (client, track) => {
         return null;
       })
       .catch(err => {
-        console.log('searchTrack :: error :: ', err);
+        functions.logger.log('searchTrack :: error :: ', err);
         return null;
       });
 
@@ -90,16 +98,16 @@ const searchTrack = async (client, track) => {
 };
 
 const batchImportTracks = async collection => {
-  console.log('batchImportTracks :: ', collection);
+  functions.logger.log('batchImportTracks :: ', collection);
   for (let track of collection) {
-    await importTrack(track.track.Item, track); // eslint-disable-line no-await-in-loop
+    await importTrack(track.track.item, track); // eslint-disable-line no-await-in-loop
   }
 
   return Promise.resolve();
 };
 
 const importTrack = async (trackId, track) => {
-  console.log('importTrack :: ', trackId, track);
+  functions.logger.log('importTrack :: ', trackId, track);
   // Grab the current accessToken from the db
   const accessToken = await admin
     .database()
@@ -125,7 +133,7 @@ const importTrack = async (trackId, track) => {
   });
 
   // TODO: only refresh the access token when necessary.
-  // await refreshAccessToken(spotify);
+  await refreshAccessToken(spotify);
 
   const spotifyUri = await searchTrack(spotify, track.track);
 
@@ -159,15 +167,34 @@ const importTrack = async (trackId, track) => {
  * The root webhook URL for triggering an import
  */
 exports.importTracks = functions.https.onRequest(async (req, res) => {
-  console.log('importTracks :: ', req.body);
+  functions.logger.log('importTracks :: ', req.body);
   const { order_id, tracks } = req.body;
 
   // Format the array as a hash with the track ID as the key.
   const trackCollection = tracks.reduce((acc, track) => {
-    const key = track.Item;
-    acc[key] = track;
+
+    // Capitalization is inconsistent, so lowercase all the keys.
+    // This will only work for 1 layer.
+    const sanitizedTrack = Object.keys(track).reduce((obj, key) => {
+      obj[key.toLowerCase()] = track[key];
+      return obj;
+    }, {});
+
+    const id = sanitizedTrack.item;
+
+    // If the ID is in an unexpected format, bail out.
+    // Ex: this happened once when pre-ordering a track.
+    if (!Number(id)) {
+      return acc;
+    }
+
+    acc[id] = sanitizedTrack;
     return acc;
   }, {});
+
+  if (!Object.keys(trackCollection)) {
+    functions.logger.error(`🚨 Unable to parse any tracks for order ${order_id}`);
+  }
 
   await admin
     .database()
@@ -176,7 +203,7 @@ exports.importTracks = functions.https.onRequest(async (req, res) => {
     .set({ tracks: trackCollection });
 
   // Respond to webhook
-  res.send(200);
+  res.sendStatus(200);
 });
 
 /**
@@ -184,7 +211,7 @@ exports.importTracks = functions.https.onRequest(async (req, res) => {
  * Do take another pass at searching/importing tracks on Spotify
  */
 exports.retrySpotify = functions.https.onRequest(async (req, res) => {
-  console.log('retrySpotify');
+  functions.logger.log('retrySpotify');
 
   const orphanTracks = await admin
     .database()
@@ -199,7 +226,7 @@ exports.retrySpotify = functions.https.onRequest(async (req, res) => {
   res.status(200).send(JSON.stringify(orphanTracks));
 
   await batchImportTracks(Object.values(orphanTracks));
-  console.log('retrySpotify :: complete');
+  functions.logger.log('retrySpotify :: complete');
   return;
 });
 
@@ -218,7 +245,7 @@ exports.onNewPurchase = functions.database
         await admin
           .database()
           .ref('/tracks')
-          .child(track.Item)
+          .child(track.item)
           .set({ track });
       }),
     );
@@ -234,6 +261,6 @@ exports.onNewTracks = functions.database
     const trackId = context.params.id;
     const track = snapshot.val();
     await importTrack(trackId, track);
-    console.log('onNewTracks :: complete');
+    functions.logger.log('onNewTracks :: complete');
     return;
   });
